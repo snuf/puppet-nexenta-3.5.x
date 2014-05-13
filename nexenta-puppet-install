@@ -1,0 +1,260 @@
+#! /bin/bash -x
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+####
+# Installing puppet for fun and profit on nexenta 3.5.x
+# (for openindiana it's more simple)
+#  tested with
+#   chef-11.8.0-1.solaris2.5.10.solaris and 
+#   puppet-enterprise-3.1.0-solaris-10-i386.tar.gz
+#
+# chef is required to get rid of the following problem:
+# root@nexenta:/export/home/jdoe# /opt/puppet/bin/ruby 
+# ld.so.1: ruby: fatal: libc.so.1: version `SUNW_1.22.6' not found 
+#   (required by file /opt/puppet/bin/ruby)
+# ld.so.1: ruby: fatal: libc.so.1: open failed: No such file or directory
+# Killed
+# As the SUNW_1.22.6 is missing from the Nexenta libc in 3.5 and 
+#   versions prior.
+#
+# Openindiana does support SUNW_1.22.6, but doesn't like the pkgadd 
+#   that's done from the installer
+#
+# Todo: 
+#   Add the smf script for chef that I made earlier so chef is fully 
+#       functional too. 
+#   Make it throw less concerning messages that don't matter at all...
+#
+
+##
+#
+##
+# re-alien packages to deb, and preserve scripts and versions
+function realien {
+	pkg=$1
+	x_ver=$(echo ${pkg} | perl -lne 'print $1 if s/-([\d+\.\-p]+)\./$1/')
+	alien -g --scripts ${pkg}
+        pkgdir=$(ls -1 | grep orig | sed -e 's/.orig//')
+	debrules="${pkgdir}/debian/rules"
+	debcontrol="${pkgdir}/debian/control"
+	# perl -pi -e 's/Package: pup/Package: pe-/' $debcontrol
+	perl -pi -e "s/dh_gencontrol/dh_gencontrol\n\tperl -pi -e \"s\/Version: .*\/Version: ${x_ver}\/\" debian\/\\$\{PACKAGE\}\/DEBIAN\/control\n/" $debrules
+	alien_opwd=$PWD
+	cd $pkgdir
+	make -f debian/rules binary
+	cd $alien_opwd
+	rm -rf ${pkgdir}.orig $pkgdir
+}
+
+# do chef stuff
+function dochef {
+	_chef=$1 
+	_debchef=$2
+	chef=$(ls ${_chef})
+	deb_chef=$(ls ${_debchef})
+	if [[ -n "$chef" && -n "$deb_chef" ]]; 
+	then
+		echo "have both $chef and $deb_chef"
+	elif [[ -n "$deb_chef" ]]; 
+	then
+		echo "have $deb"
+	elif [[ -n "$chef" ]];
+	then
+		if [ "${RELEASE}" = "nexenta" ]; then
+			echo "repackage $chef to deb"
+			realien $chef
+			deb_chef=$(ls ${_debchef})
+		fi
+	else
+		echo "no chef deb or pkg package found, download the solaris x86 one...we need it's working ruby..."
+		exit
+	fi
+
+	if [ "${RELEASE}" = "nexenta" ]; then
+		dpkg -i $deb_chef
+	elif [ "${RELEASE}" = "openindiana" ]; then
+		pkgadd -d $chef all
+	else
+		echo "nope."
+        fi
+}
+
+# now restart puppet as it will have failed to start prior to this.
+function restart {
+	/usr/sbin/svcadm disable svc:/network/pe-puppet:default
+	/usr/sbin/svcadm disable svc:/network/pe-mcollective:default
+	/usr/sbin/svcadm enable svc:/network/pe-puppet:default
+	/usr/sbin/svcadm enable svc:/system/cron:default
+}
+
+##
+# Should ideally do some pairing matrix for chef and puppet ruby matches
+##
+# set some basics 
+chef_pkg="chef-11.*.solaris" 
+chef_deb="chef_11.*.deb"
+pup_ep_tgz=$(ls puppet-enterprise-3.*-solaris-10-i386.tar.gz)
+pup_ep_instdir=$(echo $pup_ep_tgz | sed -e s/.tar.gz//)
+
+# figure out who we are and what we have
+if grep -qi 'Nexenta' /etc/release; then
+	RELEASE="nexenta"
+	has_chef=$(dpkg -l chef | grep ii | awk '{ print $3 }')
+	has_puppet=$(dpkg -l puppuppet-enterprise-release | grep ii | awk '{ print $3 }')
+elif grep -qi 'openindiana' /etc/release; then
+	RELEASE="openindiana"
+	has_chef=$(pkginfo -l chef | grep VER | awk '{ print $2 }')
+	has_puppet=$(pkginfo -l PUPpet-enterprise-release | grep VER | awk '{ print $2 }')
+else
+	RELEASE="unknown"
+	echo "unknown release"
+	exit
+fi
+
+# check for chef if not there install it, or try to
+if [ -z "$has_chef" ];
+then
+	echo "no chef found, setting it up"
+	dochef $chef_pkg $chef_deb
+else
+	echo "has chef $has_chef already (11.8.0 was tested)"
+fi
+
+# if there's no puppet yet
+if [ -z "$has_puppet" ];
+then
+	if [ -z "$pup_ep_tgz" ];
+	then
+    		echo "please download puppet enterprise... we need it for ehm... puppet enterprise..."
+    		exit
+	else
+		if [ ! -d "$pup_ep_instdir" ]
+		then
+			tar -zxvf $pup_ep_tgz
+		fi
+	fi
+else
+	echo "has puppet-enteprise $has_puppet (3.1.0 was tested)"
+	exit
+fi
+
+# get the package dir and unpack the packages there
+pre_pwd=$PWD
+pup_ep_pkgs=`find ${pup_ep_instdir}/packages -type d | tail -1`
+gunzip $pup_ep_pkgs/*.pkg.gz
+cd $pup_ep_pkgs
+if [ "${RELEASE}" = "nexenta" ]; then
+	pkgc=$(ls -1 *.pkg | wc -l)
+	debc=$(ls -1 *.deb | wc -l)
+	if [ "$debc" == "$pkgc" ]; then
+		echo "debs vs pkg = $debc vs $pkgc, assuming packages have already been converted"
+	else
+		echo "debs vs pkg = $debc vs $pkgc, count mismatch, repackaging"
+		for pkg in $(ls -1 *.pkg)
+		do
+			realien $pkg		
+		done
+	fi
+	gzip *.pkg
+	dpkg -i *.deb
+elif [ "${RELEASE}" = "openindiana" ]; then
+	# solaris with "normal" oldfashioned package management
+        for pkg in $(ls -1 *.pkg)
+	do
+		# perhaps add the dir  ?
+		yes | pkgadd -d $pkg all
+	done
+	gzip *.pkg
+	restart
+	exit
+else
+	echo "dude ?"
+	exit
+fi
+
+##
+# now setup the ruby libraries so puppet can actually work on Nexenta
+# on others this has already bombed out.
+##
+puphome="/opt/puppet"
+pupbin="${puphome}/bin"
+puprublib="${puphome}/lib/ruby"
+pupmv="${puprublib}/site_ruby/1.9.1"
+
+chefhome="/opt/chef/embedded"
+cheflib="${chefhome}/lib"
+chefrublib="${cheflib}/ruby"
+chefrubbin="${chefhome}/bin"
+
+# make this more dynamic later
+lib=${cheflib}
+rublib=${chefrublib}
+rubbin=${chefrubbin}
+
+join="/opt/mc-puppet"
+joinlib="${join}/lib"
+joinrublib="${joinlib}/ruby"
+joinmv="${joinlib}/ruby/site_ruby/1.9.1"
+
+# if the master of ceremonies joined dir doesn't exist yet create it
+# and fill it. Seems like we only really need to replace the 
+# site_ruby/1.9.1 from puppet with the one from chef.
+if [ ! -d "$join" ]; then
+	mkdir -p ${joinlib}
+	# first the main ruby we found and clean it out
+	cp -pr $rublib $joinrublib
+	mkdir -p ${joinmv}
+	mv ${joinmv} ${joinmv}.old
+	# then the puppet stuff over the old chef
+	cp -pr ${pupmv} ${joinmv}
+fi
+
+# for all scripts in bin and sbin we want env at the top so we can
+# call them by means of a wrapper that replaces ruby
+change=$(grep \#\! /opt/puppet/*/*  | grep ruby | egrep -v "Bin|env" | awk -F: '{ print $1 }')
+for file in $change
+do
+	echo modifying $file
+	perl -i -pe '$x="#!/usr/bin/env /opt/puppet/bin/ruby"; if ($. == 1) { s/.*/$x/; }' $file
+done
+
+# if the ruby.borked is missing we will replace move ruby out of
+# the way and replace it with a wrapper that loads the correct
+# env variables for puppet to function with chef's ruby libs
+# and chef's ruby
+if [ ! -e "${pupbin}/ruby.borked" ];then
+        mv ${pupbin}/ruby ${pupbin}/ruby.borked
+        # place
+        cat <<EOF > ${pupbin}/ruby
+#!/bin/sh
+MC=${join}
+export RUBYLIB=\${MC}/lib:\${MC}/lib/ruby:\${MC}/lib/ruby/site_ruby/1.9.1:\${MC}/lib/ruby/1.9.1
+export LD_LIBRARY_PATH=\${MC}/lib
+# export GEM_PATH=\${MC}/lib/ruby/gems/1.9.1:/opt/mc-puppet/lib/ruby/1.9.1/rubygems
+exec "/opt/chef/embedded/bin/ruby" "\$@"
+EOF
+	chmod 755 ${pupbin}/ruby
+fi
+
+
+# setup the version we want.. so we're enterprize, we need this or else
+# mcollective will just not work
+echo `dpkg -l | grep puppet-enterprise | awk '{ print $3 }'` > /opt/puppet/pe_version
+
+restart
